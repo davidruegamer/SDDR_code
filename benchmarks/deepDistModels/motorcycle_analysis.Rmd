@@ -1,0 +1,167 @@
+---
+title: "Motorcycle"
+output: pdf_document
+---
+
+```{r, echo=FALSE, message=FALSE}
+library(deepregression)
+```
+
+```{r}
+train <- read.csv("data/motorcycle_train.csv")
+test <- read.csv("data/motorcycle_test.csv")
+# for plotting
+mcycle <- rbind(train,test)
+```
+
+## Define network structure as defined in Rodrigues and Pereira (2018)
+
+```{r}
+deep_mod <- function(x) x %>% 
+  layer_dense(units = 50, activation = "tanh", use_bias = TRUE) %>%
+  layer_dense(units = 10, activation = "linear") %>%
+  layer_dense(units = 1, activation = "linear")
+
+```
+
+## Fit SDDL
+
+```{r pressure, echo=FALSE, cache=TRUE}
+set.seed(42)
+
+res = data.frame(RMSE = NA, time = NA)
+
+nrsims <- 20
+
+best_rmse <- Inf
+
+for(sim_iteration in 1:nrsims){
+
+  mod_deep <- deepregression(y = train$accel, 
+                             list_of_formulae = list(loc = ~ 0 + d(times),
+                                                     scale = ~ 1 + times),
+                             list_of_deep_models = list(deep_mod, NULL),
+                             data = train,
+                             family = "normal",
+                             cv_folds = 5)
+  
+  st <- Sys.time()
+  
+  (ep <- stop_iter_cv_result(mod_deep %>% cv(epochs = 5000)))
+  
+  mod_deep %>% fit(epochs = ep, 
+                   verbose = FALSE, view_metrics = FALSE,
+                   validation_split = NULL)
+  
+  et <- Sys.time()
+  
+  pred <- mod_deep %>% predict(test)
+  
+  (rmse <- sqrt(mean((pred-test$accel)^2)))
+  
+  
+  if(!is.nan(rmse) && best_rmse > rmse){
+    
+    #### get mean and quantiles
+    mean <- mod_deep %>% mean(data = mcycle)
+    q40 <- mod_deep %>% quantile(data = mcycle, value = 0.4)
+    q60 <- mod_deep %>% quantile(data = mcycle, value = 0.6)
+    q10 <- mod_deep %>% quantile(data = mcycle, value = 0.1)
+    q90 <- mod_deep %>% quantile(data = mcycle, value = 0.9)
+    
+    #### for plotting
+    fitdf <- cbind(mcycle, data.frame(mean = mean,
+                                      q40 = q40,
+                                      q60 = q60,
+                                      q10 = q10,
+                                      q90 = q90)
+    )
+    
+    best_rmse <- rmse
+    
+  }
+  
+  res[sim_iteration, ] <- c(rmse, as.numeric(difftime(et,st,units="mins")))
+  
+}
+
+# get performance and times
+apply(res, 2, function(x) c(mean(x, na.rm=T), sd(x, na.rm=T)))
+
+library(reshape2)
+library(ggplot2)
+
+fitdf %>% 
+  ggplot() + 
+  geom_point(aes(x=times, y=accel)) + 
+  geom_line(aes(x=times, y=mean), col="red", linetype = 1) + 
+  geom_line(aes(x=times, y=q40), col="red", linetype = 2) + 
+  geom_line(aes(x=times, y=q60), col="red", linetype = 2) + 
+  geom_line(aes(x=times, y=q10), col="red", linetype = 3) + 
+  geom_line(aes(x=times, y=q90), col="red", linetype = 4) + theme_bw() + 
+  theme(text = element_text(size = 14)) + ylab("Acceleration") + xlab("Time")
+```
+
+## Define Multi Tilted Loss
+
+```{r}
+multi_tilted_loss <- function(quantiles = c(0.1,0.4,0.6,0.9), y, f)
+{
+    loss = k_mean(k_square(y[,1]-f[,1]))
+    for(k in 1:length(quantiles)){
+      q = quantiles[k]
+      e = (y[,k+1]-f[,k+1])
+      loss = loss + k_mean(q * e + k_clip(-e, k_epsilon(), Inf))
+    }
+    return(loss)
+}
+```
+
+## Compile and Fit DJMQR
+
+```{r}
+nr_quantiles = 4
+y = do.call("cbind", list(train$accel)[rep(1,5)])
+ytest = do.call("cbind", list(test$accel)[rep(1,5)])
+
+res = data.frame(RMSE = NA, crossings = NA)
+
+nrsims <- 20
+
+for(sim_iteration in 1:nrsims){
+  
+  DJMQR <- keras_model_sequential()
+  DJMQR %>% 
+    layer_dense(units = 50, activation = "tanh", use_bias = TRUE) %>%
+    layer_dense(units = 10, activation = "linear") %>%
+    layer_dense(units = nr_quantiles + 1, activation = "linear") %>%
+    compile(
+      optimizer = "adam",
+      loss      = function(y, f) multi_tilted_loss(y = y, f = f)
+    )
+  
+  history_minibatches <- fit(
+    object           = DJMQR, 
+    x                = as.matrix(train[,-2,drop=FALSE]), 
+    y                = y,
+    batch_size       = 128,
+    epochs           = 3000,
+    validation_split = NULL,
+    validation_data = list(as.matrix(test[,-2,drop=FALSE]),ytest),
+    view_metrics = FALSE,
+    verbose = FALSE
+  )
+  
+  predictions_multi = DJMQR %>% predict(as.matrix(test[,-2,drop=FALSE]))
+  
+  ## Evaluate DJMQR
+  
+  res[sim_iteration,1] <- sqrt(mean((predictions_multi[,1] - ytest[,1])^2))
+  res[sim_iteration,2] <- sum(predictions_multi[,c(2:4)] > predictions_multi[,3:5])
+  
+}
+
+apply(res,2,function(x) paste0(round(mean(x),4), " (", round(sd(x),4), ")"))
+
+```
+
